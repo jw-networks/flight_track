@@ -16,15 +16,18 @@ class DeltaLookupError(RuntimeError):
 
 class DeltaFlightStatusClient:
     """
-    Loads Delta's direct flight-number status page.
+    Loads Delta's full flight-details URL.
 
-    Delta's `/flightstatus/search` page currently searches by route. Flight
-    numbers are opened with `/flightstatus/{number}`.
+    Delta route format:
+        /flightstatus/1/{flight_number}/{YYYY-MM-DD}/w
+
+    Example:
+        https://www.delta.com/flightstatus/1/2738/2026-07-18/w
     """
 
     BASE_URL = "https://www.delta.com/flightstatus"
 
-    def __init__(self, headless: bool = True, timeout: int = 35) -> None:
+    def __init__(self, headless: bool = True, timeout: int = 40) -> None:
         self.headless = headless
         self.timeout = timeout
 
@@ -46,7 +49,7 @@ class DeltaFlightStatusClient:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1440,1600")
+        options.add_argument("--window-size=1440,1800")
         options.add_argument("--lang=en-US")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument(
@@ -54,6 +57,11 @@ class DeltaFlightStatusClient:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         )
+        options.add_experimental_option(
+            "excludeSwitches",
+            ["enable-automation", "enable-logging"],
+        )
+        options.add_experimental_option("useAutomationExtension", False)
 
         for binary in (
             "/usr/bin/chromium",
@@ -98,9 +106,12 @@ class DeltaFlightStatusClient:
 
     @staticmethod
     def _body_text(driver) -> str:
-        return driver.execute_script(
-            "return document.body ? document.body.innerText : '';"
-        ) or ""
+        try:
+            return driver.execute_script(
+                "return document.body ? document.body.innerText : '';"
+            ) or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _dismiss_banners(driver) -> None:
@@ -108,18 +119,22 @@ class DeltaFlightStatusClient:
             driver.execute_script(
                 """
                 const terms = ['accept', 'agree', 'continue', 'allow all'];
-                for (const el of document.querySelectorAll(
+                const elements = document.querySelectorAll(
                     'button, [role="button"]'
-                )) {
+                );
+
+                for (const element of elements) {
                     const text = (
-                        el.innerText ||
-                        el.getAttribute('aria-label') ||
+                        element.innerText ||
+                        element.getAttribute('aria-label') ||
                         ''
-                    ).toLowerCase();
+                    ).trim().toLowerCase();
 
                     if (terms.some(term => text.includes(term))) {
-                        el.click();
-                        break;
+                        try {
+                            element.click();
+                            break;
+                        } catch (error) {}
                     }
                 }
                 """
@@ -132,11 +147,16 @@ class DeltaFlightStatusClient:
 
         ident = normalize_delta_flight_number(flight_number)
         numeric_flight = ident.removeprefix("DL")
+        date_text = flight_date.isoformat()
 
-        # Delta's direct flight-number route.
-        url = f"{self.BASE_URL}/{quote(numeric_flight)}"
+        url = (
+            f"{self.BASE_URL}/1/"
+            f"{quote(numeric_flight)}/"
+            f"{quote(date_text)}/w"
+        )
 
         driver = self._new_driver()
+
         try:
             driver.get(url)
 
@@ -148,17 +168,21 @@ class DeltaFlightStatusClient:
 
             self._dismiss_banners(driver)
 
-            # Delta initially displays a loading animation while its client-side
-            # application retrieves the status.
+            # Wait for Delta's client-side status application to render more
+            # than the static site header/footer.
             WebDriverWait(driver, self.timeout).until(
-                lambda browser: len(self._body_text(browser).strip()) > 200
+                lambda browser: (
+                    numeric_flight in self._body_text(browser)
+                    or ident in self._body_text(browser)
+                    or "no flight" in self._body_text(browser).lower()
+                    or "not found" in self._body_text(browser).lower()
+                )
             )
 
-            # Give late-rendering status components a moment to populate.
-            time.sleep(4)
+            time.sleep(3)
             body_text = self._body_text(driver)
-
             lower = body_text.lower()
+
             if any(
                 phrase in lower
                 for phrase in (
@@ -184,48 +208,22 @@ class DeltaFlightStatusClient:
                     f"Delta did not find {ident} for {flight_date:%B %d, %Y}."
                 )
 
-            # Delta may show several daily instances or a date selector. This
-            # parser chooses the result block whose displayed date best matches
-            # the requested date when the date is present.
-            selected_text = self._select_date_section(body_text, flight_date)
-
-            if numeric_flight not in selected_text and ident not in selected_text:
+            if numeric_flight not in body_text and ident not in body_text:
                 raise DeltaLookupError(
-                    "Delta loaded the direct flight page, but the rendered "
-                    "result did not contain the requested flight number. "
-                    f"Page preview: {body_text[:700]}"
+                    "Delta loaded the full details URL, but the rendered page "
+                    "still did not contain the requested flight number. "
+                    f"Loaded URL: {driver.current_url}. "
+                    f"Page preview: {body_text[:900]}"
                 )
 
             return self._parse_page_text(
-                selected_text,
-                ident,
-                flight_date,
+                body_text=body_text,
+                ident=ident,
+                flight_date=flight_date,
                 source_url=driver.current_url,
             )
         finally:
             driver.quit()
-
-    @staticmethod
-    def _select_date_section(text: str, requested_date: date) -> str:
-        """
-        Prefer a block containing the requested date. If Delta does not print
-        dates in the accessible body text, return the full page.
-        """
-        date_forms = (
-            requested_date.strftime("%B %-d, %Y"),
-            requested_date.strftime("%b %-d, %Y"),
-            requested_date.strftime("%m/%d/%Y"),
-            requested_date.strftime("%Y-%m-%d"),
-        )
-
-        lines = text.splitlines()
-        for index, line in enumerate(lines):
-            if any(form.lower() in line.lower() for form in date_forms):
-                start = max(0, index - 10)
-                end = min(len(lines), index + 80)
-                return "\n".join(lines[start:end])
-
-        return text
 
     @staticmethod
     def _match(text: str, patterns: Iterable[str]) -> str | None:
@@ -241,11 +239,13 @@ class DeltaFlightStatusClient:
             "DEL", "ETA", "EST", "ACT", "AM", "PM", "DL",
             "USD", "FAQ", "SMS", "TSA",
         }
-        codes: list[str] = []
+        result: list[str] = []
+
         for code in re.findall(r"(?<![A-Z])([A-Z]{3})(?![A-Z])", text):
-            if code not in ignored and code not in codes:
-                codes.append(code)
-        return codes
+            if code not in ignored and code not in result:
+                result.append(code)
+
+        return result
 
     def _parse_page_text(
         self,
@@ -318,6 +318,7 @@ class DeltaFlightStatusClient:
             text,
             re.I,
         )
+
         if not scheduled_departure and all_times:
             scheduled_departure = all_times[0]
         if not scheduled_arrival and len(all_times) > 1:
@@ -367,7 +368,9 @@ class DeltaFlightStatusClient:
                 "city": "",
                 "terminal": self._match(
                     text,
-                    (r"Arrival Terminal\s*[:\n ]+\s*([A-Z0-9-]+)",),
+                    (
+                        r"Arrival Terminal\s*[:\n ]+\s*([A-Z0-9-]+)",
+                    ),
                 ),
                 "gate": gates[1] if len(gates) > 1 else None,
                 "baggage_claim": self._match(
@@ -418,6 +421,7 @@ class DeltaFlightStatusClient:
             )
             if match:
                 return match.group(1).upper()
+
         return None
 
     @staticmethod
