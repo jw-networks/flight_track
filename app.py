@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 import json
-import os
 import time
 
 import streamlit as st
 
-from flight_provider import FlightAwareClient, FlightLookupError
+from delta_provider import DeltaFlightStatusClient, DeltaLookupError
 from flight_utils import (
     build_esp32_payload,
-    choose_flight,
     demo_flight,
     format_clock,
     format_duration,
-    normalize_delta_ident,
+    normalize_delta_flight_number,
     progress_percent,
 )
 
@@ -22,13 +20,12 @@ st.set_page_config(
     page_title="Delta Flight Dashboard",
     page_icon="✈️",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.7rem; padding-bottom: 2rem;}
+      .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
       [data-testid="stMetric"] {
         border: 1px solid rgba(128,128,128,.25);
         border-radius: 12px;
@@ -39,77 +36,58 @@ st.markdown(
         border-radius: 16px;
         padding: 18px 22px;
         margin-bottom: 18px;
-        background: linear-gradient(120deg, #7a0019, #b0002b);
+        background: linear-gradient(120deg, #710019, #b0002b);
         color: white;
       }
-      .flight-banner h2 {margin: 0; padding: 0;}
-      .flight-banner p {margin: 5px 0 0 0; opacity: .88;}
-      .small-label {opacity: .7; font-size: .82rem;}
+      .flight-banner h2 {margin: 0;}
+      .flight-banner p {margin: 5px 0 0; opacity: .9;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-def get_api_key() -> str:
-    """Read the key from Streamlit secrets first, then the environment."""
-    try:
-        return str(st.secrets.get("FLIGHTAWARE_API_KEY", "")).strip()
-    except Exception:
-        return os.getenv("FLIGHTAWARE_API_KEY", "").strip()
 
-def load_flight(ident: str, flight_date: date, demo_mode: bool) -> dict:
-    if demo_mode:
-        return demo_flight(ident, flight_date)
+@st.cache_data(ttl=60, show_spinner=False)
+def load_delta_flight(flight_number: str, flight_date: date) -> dict:
+    client = DeltaFlightStatusClient(headless=True)
+    return client.get_flight(flight_number, flight_date)
 
-    api_key = get_api_key()
-    if not api_key:
-        raise FlightLookupError(
-            "No FlightAware API key was found. Add it to "
-            "`.streamlit/secrets.toml` or enable Demo mode."
-        )
 
-    client = FlightAwareClient(api_key=api_key)
-    candidates = client.get_flights(ident, flight_date)
-    return choose_flight(candidates, flight_date)
-
-def show_time_column(title: str, airport: dict, scheduled_key: str,
-                     estimated_key: str, actual_key: str) -> None:
+def show_airport(title: str, airport: dict) -> None:
     st.subheader(title)
     st.markdown(
-        f"### {airport.get('code', '—')}  \n"
-        f"{airport.get('name', '')}"
+        f"### {airport.get('code') or '—'}  \n"
+        f"{airport.get('name') or ''}"
     )
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Scheduled", format_clock(airport.get(scheduled_key)))
-    c2.metric("Estimated", format_clock(airport.get(estimated_key)))
-    c3.metric("Actual", format_clock(airport.get(actual_key)))
+    c1.metric("Scheduled", format_clock(airport.get("scheduled")))
+    c2.metric("Estimated", format_clock(airport.get("estimated")))
+    c3.metric("Actual", format_clock(airport.get("actual")))
 
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Terminal", airport.get("terminal") or "—")
-    d2.metric("Gate", airport.get("gate") or "—")
-    d3.metric(
-        "Delay",
-        f"{airport.get('delay_minutes', 0)} min",
-        delta=None,
-    )
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Terminal", airport.get("terminal") or "—")
+    c5.metric("Gate", airport.get("gate") or "—")
+    c6.metric("Delay", f"{airport.get('delay_minutes', 0)} min")
+
 
 with st.sidebar:
     st.title("Flight Search")
+
     with st.form("flight_search"):
-        flight_number = st.text_input(
+        raw_number = st.text_input(
             "Delta flight number",
-            value=st.session_state.get("flight_number", "DL1234"),
+            value=st.session_state.get("raw_number", "DL1234"),
             placeholder="DL1234 or 1234",
         )
-        flight_date = st.date_input(
+        selected_date = st.date_input(
             "Flight date",
-            value=st.session_state.get("flight_date", date.today()),
+            value=st.session_state.get("selected_date", date.today()),
         )
         demo_mode = st.toggle(
             "Demo mode",
             value=st.session_state.get("demo_mode", True),
-            help="Uses realistic sample data and does not call FlightAware.",
+            help="Uses sample data instead of loading Delta.com.",
         )
         submitted = st.form_submit_button(
             "Load flight",
@@ -118,140 +96,100 @@ with st.sidebar:
         )
 
     st.divider()
-    auto_refresh = st.toggle(
-        "Auto-refresh",
-        value=False,
-        help="Refreshes the page at the selected interval.",
-    )
+    auto_refresh = st.toggle("Auto-refresh", value=False)
     refresh_seconds = st.select_slider(
         "Refresh interval",
-        options=[30, 60, 120, 300],
-        value=60,
-        format_func=lambda value: f"{value} sec",
+        options=[60, 120, 300, 600],
+        value=120,
+        format_func=lambda seconds: f"{seconds} sec",
         disabled=not auto_refresh,
     )
 
 if submitted:
-    st.session_state.flight_number = flight_number
-    st.session_state.flight_date = flight_date
+    st.session_state.raw_number = raw_number
+    st.session_state.selected_date = selected_date
     st.session_state.demo_mode = demo_mode
-    st.session_state.should_load = True
+    st.session_state.load_requested = True
+    load_delta_flight.clear()
 
 st.title("Delta Flight Dashboard")
-st.caption("Live flight status now; compact ESP32 display payload later.")
+st.caption("Flight information loaded directly from Delta.com.")
 
-if not st.session_state.get("should_load", False):
-    st.info("Enter a Delta flight number in the sidebar and select **Load flight**.")
+if not st.session_state.get("load_requested"):
+    st.info("Enter a Delta flight number and select **Load flight**.")
     st.stop()
 
 try:
-    ident = normalize_delta_ident(st.session_state.flight_number)
-    with st.spinner(f"Loading {ident}…"):
-        flight = load_flight(
-            ident,
-            st.session_state.flight_date,
-            st.session_state.demo_mode,
-        )
-except (ValueError, FlightLookupError) as exc:
+    flight_number = normalize_delta_flight_number(st.session_state.raw_number)
+
+    with st.spinner(f"Checking Delta flight {flight_number}…"):
+        if st.session_state.demo_mode:
+            flight = demo_flight(flight_number, st.session_state.selected_date)
+        else:
+            flight = load_delta_flight(
+                flight_number,
+                st.session_state.selected_date,
+            )
+except (ValueError, DeltaLookupError) as exc:
     st.error(str(exc))
-    st.stop()
-except Exception as exc:
-    st.error(f"Unexpected error: {exc}")
+    st.caption(
+        "Delta does not publish this web interface as a supported public API. "
+        "A Delta.com layout or bot-protection change may require updating "
+        "`delta_provider.py`."
+    )
     st.stop()
 
 origin = flight["origin"]
 destination = flight["destination"]
-status = flight.get("status", "Unknown")
 progress = progress_percent(flight)
 
 st.markdown(
     f"""
     <div class="flight-banner">
-      <h2>{flight.get('ident', ident)} · {origin.get('code', '—')} → {destination.get('code', '—')}</h2>
-      <p>{status} · {flight.get('aircraft_type') or 'Aircraft pending'} ·
+      <h2>{flight.get('ident', flight_number)} ·
+      {origin.get('code', '—')} → {destination.get('code', '—')}</h2>
+      <p>{flight.get('status', 'Unknown')} ·
       Updated {format_clock(flight.get('updated_at'), include_zone=True)}</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-top1, top2, top3, top4, top5 = st.columns(5)
-top1.metric("Status", status)
-top2.metric("Progress", f"{progress}%")
-top3.metric(
-    "Arrival delay",
-    f"{destination.get('delay_minutes', 0)} min",
-)
-top4.metric(
-    "Time remaining",
-    format_duration(flight.get("minutes_remaining")),
-)
-top5.metric(
-    "Distance remaining",
-    f"{flight.get('distance_remaining_nm', 0):,.0f} nm"
-    if flight.get("distance_remaining_nm") is not None else "—",
-)
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Status", flight.get("status") or "Unknown")
+m2.metric("Progress", f"{progress}%")
+m3.metric("Arrival delay", f"{destination.get('delay_minutes', 0)} min")
+m4.metric("Aircraft", flight.get("aircraft_type") or "—")
+m5.metric("Baggage", destination.get("baggage_claim") or "—")
 
 st.progress(progress / 100, text=f"{progress}% complete")
 
 left, right = st.columns(2)
 with left:
-    show_time_column(
-        "Departure",
-        origin,
-        "scheduled",
-        "estimated",
-        "actual",
-    )
+    show_airport("Departure", origin)
 with right:
-    show_time_column(
-        "Arrival",
-        destination,
-        "scheduled",
-        "estimated",
-        "actual",
-    )
+    show_airport("Arrival", destination)
 
 st.divider()
-st.subheader("Flight Metrics")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Altitude", f"{flight.get('altitude_ft', 0):,.0f} ft"
-          if flight.get("altitude_ft") is not None else "—")
-m2.metric("Ground speed", f"{flight.get('ground_speed_kts', 0):,.0f} kt"
-          if flight.get("ground_speed_kts") is not None else "—")
-m3.metric("Aircraft", flight.get("aircraft_type") or "—")
-m4.metric("Registration", flight.get("registration") or "—")
+st.subheader("Additional Details")
 
-m5, m6, m7, m8 = st.columns(4)
-m5.metric("Flight time", format_duration(flight.get("flight_minutes")))
-m6.metric("Scheduled time", format_duration(flight.get("scheduled_minutes")))
-m7.metric("Distance flown", f"{flight.get('distance_flown_nm', 0):,.0f} nm"
-          if flight.get("distance_flown_nm") is not None else "—")
-m8.metric("Total distance", f"{flight.get('route_distance_nm', 0):,.0f} nm"
-          if flight.get("route_distance_nm") is not None else "—")
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Scheduled duration", format_duration(flight.get("scheduled_minutes")))
+d2.metric("Estimated duration", format_duration(flight.get("flight_minutes")))
+d3.metric("Departure city", origin.get("city") or "—")
+d4.metric("Arrival city", destination.get("city") or "—")
 
-if flight.get("latitude") is not None and flight.get("longitude") is not None:
-    st.subheader("Current Position")
-    st.map(
-        {
-            "lat": [flight["latitude"]],
-            "lon": [flight["longitude"]],
-        },
-        zoom=4,
-        use_container_width=True,
-    )
-
-with st.expander("ESP32-ready compact payload", expanded=True):
-    esp_payload = build_esp32_payload(flight)
-    st.code(json.dumps(esp_payload, indent=2), language="json")
+with st.expander("ESP32-ready payload", expanded=True):
+    payload = build_esp32_payload(flight)
+    st.code(json.dumps(payload, indent=2), language="json")
     st.download_button(
-        "Download payload JSON",
-        data=json.dumps(esp_payload, separators=(",", ":")),
-        file_name=f"{flight.get('ident', ident)}_esp32.json",
+        "Download JSON",
+        json.dumps(payload, separators=(",", ":")),
+        file_name=f"{flight_number}_display.json",
         mime="application/json",
     )
 
-with st.expander("Normalized full flight data"):
+with st.expander("Normalized Delta data"):
     st.json(flight)
 
 if auto_refresh:
