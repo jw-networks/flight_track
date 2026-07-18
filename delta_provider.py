@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote
 
-from flight_utils import calculate_delay_minutes, normalize_delta_flight_number
+from flight_utils import (
+    calculate_delay_minutes,
+    normalize_delta_flight_number,
+)
 
 
 class DeltaLookupError(RuntimeError):
@@ -16,18 +19,19 @@ class DeltaLookupError(RuntimeError):
 
 class DeltaFlightStatusClient:
     """
-    Loads Delta's full flight-details URL.
+    Loads Delta's public full flight-details page.
 
-    Delta route format:
-        /flightstatus/1/{flight_number}/{YYYY-MM-DD}/w
-
-    Example:
-        https://www.delta.com/flightstatus/1/2738/2026-07-18/w
+    Delta URL format:
+        https://www.delta.com/flightstatus/1/{flight}/{YYYY-MM-DD}/w
     """
 
     BASE_URL = "https://www.delta.com/flightstatus"
 
-    def __init__(self, headless: bool = True, timeout: int = 40) -> None:
+    def __init__(
+        self,
+        headless: bool = True,
+        timeout: int = 40,
+    ) -> None:
         self.headless = headless
         self.timeout = timeout
 
@@ -39,10 +43,12 @@ class DeltaFlightStatusClient:
             from selenium.webdriver.chrome.service import Service
         except ModuleNotFoundError as exc:
             raise DeltaLookupError(
-                "Selenium is not installed in this deployment."
+                "Selenium is not installed. Confirm requirements.txt "
+                "contains selenium."
             ) from exc
 
         options = Options()
+
         if self.headless:
             options.add_argument("--headless=new")
 
@@ -51,17 +57,25 @@ class DeltaFlightStatusClient:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1440,1800")
         options.add_argument("--lang=en-US")
-        options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument(
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "--disable-blink-features=AutomationControlled"
+        )
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         )
+
         options.add_experimental_option(
             "excludeSwitches",
             ["enable-automation", "enable-logging"],
         )
-        options.add_experimental_option("useAutomationExtension", False)
+        options.add_experimental_option(
+            "useAutomationExtension",
+            False,
+        )
 
         for binary in (
             "/usr/bin/chromium",
@@ -86,30 +100,50 @@ class DeltaFlightStatusClient:
         )
 
         try:
-            service = Service(driver_path) if driver_path else Service()
-            driver = webdriver.Chrome(service=service, options=options)
+            service = (
+                Service(driver_path)
+                if driver_path
+                else Service()
+            )
+
+            driver = webdriver.Chrome(
+                service=service,
+                options=options,
+            )
+
             driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
                 {
                     "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
+                    Object.defineProperty(
+                        navigator,
+                        'webdriver',
+                        {get: () => undefined}
+                    );
                     """
                 },
             )
+
             return driver
+
         except WebDriverException as exc:
             raise DeltaLookupError(
-                "Chromium or ChromeDriver could not start."
+                "Chromium or ChromeDriver could not start. "
+                "Confirm packages.txt contains chromium and "
+                "chromium-driver."
             ) from exc
 
     @staticmethod
     def _body_text(driver) -> str:
         try:
-            return driver.execute_script(
-                "return document.body ? document.body.innerText : '';"
-            ) or ""
+            return (
+                driver.execute_script(
+                    "return document.body "
+                    "? document.body.innerText "
+                    ": '';"
+                )
+                or ""
+            )
         except Exception:
             return ""
 
@@ -118,7 +152,13 @@ class DeltaFlightStatusClient:
         try:
             driver.execute_script(
                 """
-                const terms = ['accept', 'agree', 'continue', 'allow all'];
+                const terms = [
+                    'accept',
+                    'agree',
+                    'continue',
+                    'allow all'
+                ];
+
                 const elements = document.querySelectorAll(
                     'button, [role="button"]'
                 );
@@ -130,7 +170,11 @@ class DeltaFlightStatusClient:
                         ''
                     ).trim().toLowerCase();
 
-                    if (terms.some(term => text.includes(term))) {
+                    if (
+                        terms.some(
+                            term => text.includes(term)
+                        )
+                    ) {
                         try {
                             element.click();
                             break;
@@ -142,7 +186,39 @@ class DeltaFlightStatusClient:
         except Exception:
             pass
 
-    def get_flight(self, flight_number: str, flight_date: date) -> dict:
+    @staticmethod
+    def _flight_content_loaded(
+        driver,
+        numeric_flight: str,
+        ident: str,
+    ) -> bool:
+        text = DeltaFlightStatusClient._body_text(driver)
+        lower = text.lower()
+
+        if numeric_flight in text or ident in text:
+            return True
+
+        terminal_messages = (
+            "no flight found",
+            "flight not found",
+            "unable to locate",
+            "access denied",
+            "verify you are human",
+            "unable to process your request",
+            "temporarily unavailable",
+        )
+
+        return any(
+            message in lower
+            for message in terminal_messages
+        )
+
+    def get_flight(
+        self,
+        flight_number: str,
+        flight_date: date,
+    ) -> dict:
+        from selenium.common.exceptions import TimeoutException
         from selenium.webdriver.support.ui import WebDriverWait
 
         ident = normalize_delta_flight_number(flight_number)
@@ -160,26 +236,42 @@ class DeltaFlightStatusClient:
         try:
             driver.get(url)
 
-            WebDriverWait(driver, self.timeout).until(
+            WebDriverWait(
+                driver,
+                self.timeout,
+            ).until(
                 lambda browser: browser.execute_script(
                     "return document.readyState"
-                ) == "complete"
+                )
+                == "complete"
             )
 
             self._dismiss_banners(driver)
 
-            # Wait for Delta's client-side status application to render more
-            # than the static site header/footer.
-            WebDriverWait(driver, self.timeout).until(
-                lambda browser: (
-                    numeric_flight in self._body_text(browser)
-                    or ident in self._body_text(browser)
-                    or "no flight" in self._body_text(browser).lower()
-                    or "not found" in self._body_text(browser).lower()
+            try:
+                WebDriverWait(
+                    driver,
+                    self.timeout,
+                ).until(
+                    lambda browser: self._flight_content_loaded(
+                        browser,
+                        numeric_flight,
+                        ident,
+                    )
                 )
-            )
+            except TimeoutException as exc:
+                body_text = self._body_text(driver)
 
-            time.sleep(3)
+                raise DeltaLookupError(
+                    "Delta's page loaded, but its flight-details "
+                    "application did not render on Streamlit Cloud. "
+                    "Delta's background status request may have been "
+                    "blocked or failed. "
+                    f"Loaded URL: {driver.current_url}. "
+                    f"Page preview: {body_text[:900]}"
+                ) from exc
+
+            time.sleep(2)
             body_text = self._body_text(driver)
             lower = body_text.lower()
 
@@ -193,7 +285,8 @@ class DeltaFlightStatusClient:
                 )
             ):
                 raise DeltaLookupError(
-                    "Delta blocked or rejected the hosted browser request."
+                    "Delta blocked or rejected the hosted "
+                    "browser request."
                 )
 
             if any(
@@ -205,13 +298,18 @@ class DeltaFlightStatusClient:
                 )
             ):
                 raise DeltaLookupError(
-                    f"Delta did not find {ident} for {flight_date:%B %d, %Y}."
+                    f"Delta did not find {ident} for "
+                    f"{flight_date:%B %d, %Y}."
                 )
 
-            if numeric_flight not in body_text and ident not in body_text:
+            if (
+                numeric_flight not in body_text
+                and ident not in body_text
+            ):
                 raise DeltaLookupError(
-                    "Delta loaded the full details URL, but the rendered page "
-                    "still did not contain the requested flight number. "
+                    "Delta loaded the full details URL, but "
+                    "the rendered page did not contain the "
+                    "requested flight number. "
                     f"Loaded URL: {driver.current_url}. "
                     f"Page preview: {body_text[:900]}"
                 )
@@ -222,27 +320,53 @@ class DeltaFlightStatusClient:
                 flight_date=flight_date,
                 source_url=driver.current_url,
             )
+
         finally:
             driver.quit()
 
     @staticmethod
-    def _match(text: str, patterns: Iterable[str]) -> str | None:
+    def _match(
+        text: str,
+        patterns: Iterable[str],
+    ) -> str | None:
         for pattern in patterns:
-            match = re.search(pattern, text, re.I | re.M)
+            match = re.search(
+                pattern,
+                text,
+                re.I | re.M,
+            )
+
             if match:
                 return match.group(1).strip()
+
         return None
 
     @staticmethod
     def _airport_codes(text: str) -> list[str]:
         ignored = {
-            "DEL", "ETA", "EST", "ACT", "AM", "PM", "DL",
-            "USD", "FAQ", "SMS", "TSA",
+            "DEL",
+            "ETA",
+            "EST",
+            "ACT",
+            "AM",
+            "PM",
+            "DL",
+            "USD",
+            "FAQ",
+            "SMS",
+            "TSA",
         }
+
         result: list[str] = []
 
-        for code in re.findall(r"(?<![A-Z])([A-Z]{3})(?![A-Z])", text):
-            if code not in ignored and code not in result:
+        for code in re.findall(
+            r"(?<![A-Z])([A-Z]{3})(?![A-Z])",
+            text,
+        ):
+            if (
+                code not in ignored
+                and code not in result
+            ):
                 result.append(code)
 
         return result
@@ -260,88 +384,161 @@ class DeltaFlightStatusClient:
         origin_code = self._match(
             text,
             (
-                r"(?:From|Depart(?:ure|ing)?)\s*[:\n ]+\s*([A-Z]{3})\b",
-                r"\b([A-Z]{3})\b\s*(?:to|→|-)\s*[A-Z]{3}\b",
+                r"(?:From|Depart(?:ure|ing)?)"
+                r"\s*[:\n ]+\s*([A-Z]{3})\b",
+                r"\b([A-Z]{3})\b"
+                r"\s*(?:to|→|-)\s*[A-Z]{3}\b",
             ),
         )
+
         destination_code = self._match(
             text,
             (
-                r"(?:To|Arriv(?:al|ing)?)\s*[:\n ]+\s*([A-Z]{3})\b",
-                r"\b[A-Z]{3}\b\s*(?:to|→|-)\s*([A-Z]{3})\b",
+                r"(?:To|Arriv(?:al|ing)?)"
+                r"\s*[:\n ]+\s*([A-Z]{3})\b",
+                r"\b[A-Z]{3}\b"
+                r"\s*(?:to|→|-)\s*([A-Z]{3})\b",
             ),
         )
 
         if not origin_code and codes:
             origin_code = codes[0]
-        if not destination_code and len(codes) > 1:
+
+        if (
+            not destination_code
+            and len(codes) > 1
+        ):
             destination_code = codes[1]
 
-        status = self._match(
-            text,
-            (
-                r"(?:Flight Status|Status)\s*[:\n ]+\s*"
-                r"(On Time|Delayed|Cancelled|Canceled|Boarding|"
-                r"Departed|En Route|Arrived|Landed|Diverted)",
-                r"\b(On Time|Delayed|Cancelled|Canceled|Boarding|"
-                r"Departed|En Route|Arrived|Landed|Diverted)\b",
-            ),
-        ) or "Unknown"
+        status = (
+            self._match(
+                text,
+                (
+                    r"(?:Flight Status|Status)"
+                    r"\s*[:\n ]+\s*"
+                    r"(On Time|Delayed|Cancelled|Canceled|"
+                    r"Boarding|Departed|En Route|Arrived|"
+                    r"Landed|Diverted)",
+                    r"\b(On Time|Delayed|Cancelled|Canceled|"
+                    r"Boarding|Departed|En Route|Arrived|"
+                    r"Landed|Diverted)\b",
+                ),
+            )
+            or "Unknown"
+        )
 
         scheduled_departure = self._labeled_time(
             text,
-            ("scheduled departure", "scheduled departs", "scheduled"),
+            (
+                "scheduled departure",
+                "scheduled departs",
+                "scheduled",
+            ),
         )
+
         estimated_departure = self._labeled_time(
             text,
-            ("estimated departure", "estimated departs"),
+            (
+                "estimated departure",
+                "estimated departs",
+            ),
         )
+
         actual_departure = self._labeled_time(
             text,
-            ("actual departure", "departed"),
+            (
+                "actual departure",
+                "departed",
+            ),
         )
+
         scheduled_arrival = self._labeled_time(
             text,
-            ("scheduled arrival", "scheduled arrives"),
+            (
+                "scheduled arrival",
+                "scheduled arrives",
+            ),
         )
+
         estimated_arrival = self._labeled_time(
             text,
-            ("estimated arrival", "estimated arrives"),
+            (
+                "estimated arrival",
+                "estimated arrives",
+            ),
         )
+
         actual_arrival = self._labeled_time(
             text,
-            ("actual arrival", "arrived"),
+            (
+                "actual arrival",
+                "arrived",
+            ),
         )
 
         all_times = re.findall(
-            r"\b(?:0?[1-9]|1[0-2]):[0-5]\d\s*(?:AM|PM)\b",
+            r"\b(?:0?[1-9]|1[0-2]):[0-5]\d"
+            r"\s*(?:AM|PM)\b",
             text,
             re.I,
         )
 
-        if not scheduled_departure and all_times:
+        if (
+            not scheduled_departure
+            and all_times
+        ):
             scheduled_departure = all_times[0]
-        if not scheduled_arrival and len(all_times) > 1:
+
+        if (
+            not scheduled_arrival
+            and len(all_times) > 1
+        ):
             scheduled_arrival = all_times[-1]
 
         gates = re.findall(
-            r"\bGate\s*[:\n ]+\s*([A-Z]?\d+[A-Z]?)\b",
+            r"\bGate\s*[:\n ]+\s*"
+            r"([A-Z]?\d+[A-Z]?)\b",
             text,
             re.I,
         )
 
-        dep_sched = self._combine_time(flight_date, scheduled_departure)
-        dep_est = self._combine_time(flight_date, estimated_departure)
-        dep_actual = self._combine_time(flight_date, actual_departure)
-        arr_sched = self._combine_time(flight_date, scheduled_arrival)
-        arr_est = self._combine_time(flight_date, estimated_arrival)
-        arr_actual = self._combine_time(flight_date, actual_arrival)
+        dep_sched = self._combine_time(
+            flight_date,
+            scheduled_departure,
+        )
+
+        dep_est = self._combine_time(
+            flight_date,
+            estimated_departure,
+        )
+
+        dep_actual = self._combine_time(
+            flight_date,
+            actual_departure,
+        )
+
+        arr_sched = self._combine_time(
+            flight_date,
+            scheduled_arrival,
+        )
+
+        arr_est = self._combine_time(
+            flight_date,
+            estimated_arrival,
+        )
+
+        arr_actual = self._combine_time(
+            flight_date,
+            actual_arrival,
+        )
 
         return {
             "ident": ident,
             "status": status.title(),
-            "cancelled": status.lower() in {"cancelled", "canceled"},
-            "diverted": status.lower() == "diverted",
+            "cancelled": status.lower()
+            in {"cancelled", "canceled"},
+            "diverted": status.lower()
+            == "diverted",
             "origin": {
                 "code": origin_code or "—",
                 "name": "",
@@ -349,17 +546,27 @@ class DeltaFlightStatusClient:
                 "terminal": self._match(
                     text,
                     (
-                        r"Departure Terminal\s*[:\n ]+\s*([A-Z0-9-]+)",
-                        r"Terminal\s*[:\n ]+\s*([A-Z0-9-]+)",
+                        r"Departure Terminal"
+                        r"\s*[:\n ]+\s*"
+                        r"([A-Z0-9-]+)",
+                        r"Terminal"
+                        r"\s*[:\n ]+\s*"
+                        r"([A-Z0-9-]+)",
                     ),
                 ),
-                "gate": gates[0] if gates else None,
+                "gate": (
+                    gates[0]
+                    if gates
+                    else None
+                ),
                 "scheduled": dep_sched,
                 "estimated": dep_est,
                 "actual": dep_actual,
-                "delay_minutes": calculate_delay_minutes(
-                    dep_actual or dep_est,
-                    dep_sched,
+                "delay_minutes": (
+                    calculate_delay_minutes(
+                        dep_actual or dep_est,
+                        dep_sched,
+                    )
                 ),
             },
             "destination": {
@@ -369,70 +576,106 @@ class DeltaFlightStatusClient:
                 "terminal": self._match(
                     text,
                     (
-                        r"Arrival Terminal\s*[:\n ]+\s*([A-Z0-9-]+)",
+                        r"Arrival Terminal"
+                        r"\s*[:\n ]+\s*"
+                        r"([A-Z0-9-]+)",
                     ),
                 ),
-                "gate": gates[1] if len(gates) > 1 else None,
+                "gate": (
+                    gates[1]
+                    if len(gates) > 1
+                    else None
+                ),
                 "baggage_claim": self._match(
                     text,
                     (
                         r"(?:Baggage Claim|Carousel)"
-                        r"\s*[:\n ]+\s*([A-Z0-9-]+)",
+                        r"\s*[:\n ]+\s*"
+                        r"([A-Z0-9-]+)",
                     ),
                 ),
                 "scheduled": arr_sched,
                 "estimated": arr_est,
                 "actual": arr_actual,
-                "delay_minutes": calculate_delay_minutes(
-                    arr_actual or arr_est,
-                    arr_sched,
+                "delay_minutes": (
+                    calculate_delay_minutes(
+                        arr_actual or arr_est,
+                        arr_sched,
+                    )
                 ),
             },
             "aircraft_type": self._match(
                 text,
                 (
                     r"(?:Aircraft|Equipment)"
-                    r"\s*[:\n ]+\s*([A-Z0-9 -]{2,40})",
+                    r"\s*[:\n ]+\s*"
+                    r"([A-Z0-9 -]{2,40})",
                 ),
             ),
             "registration": None,
-            "scheduled_minutes": self._duration_minutes(
-                dep_sched,
-                arr_sched,
+            "scheduled_minutes": (
+                self._duration_minutes(
+                    dep_sched,
+                    arr_sched,
+                )
             ),
-            "flight_minutes": self._duration_minutes(
-                dep_actual or dep_est,
-                arr_actual or arr_est,
+            "flight_minutes": (
+                self._duration_minutes(
+                    dep_actual or dep_est,
+                    arr_actual or arr_est,
+                )
             ),
             "minutes_remaining": None,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": (
+                datetime.now(timezone.utc).isoformat()
+            ),
             "raw_source": "delta.com",
             "source_url": source_url,
         }
 
     @staticmethod
-    def _labeled_time(text: str, labels: Iterable[str]) -> str | None:
+    def _labeled_time(
+        text: str,
+        labels: Iterable[str],
+    ) -> str | None:
         for label in labels:
             match = re.search(
-                rf"{re.escape(label)}[^0-9]{{0,35}}"
-                r"((?:0?[1-9]|1[0-2]):[0-5]\d\s*(?:AM|PM))",
+                rf"{re.escape(label)}"
+                r"[^0-9]{0,35}"
+                r"((?:0?[1-9]|1[0-2]):"
+                r"[0-5]\d\s*(?:AM|PM))",
                 text,
                 re.I,
             )
+
             if match:
                 return match.group(1).upper()
 
         return None
 
     @staticmethod
-    def _combine_time(day: date, value: str | None) -> str | None:
+    def _combine_time(
+        day: date,
+        value: str | None,
+    ) -> str | None:
         if not value:
             return None
 
-        for fmt in ("%I:%M %p", "%I:%M%p"):
+        for fmt in (
+            "%I:%M %p",
+            "%I:%M%p",
+        ):
             try:
-                parsed = datetime.strptime(value.upper().strip(), fmt)
-                return datetime.combine(day, parsed.time()).isoformat()
+                parsed = datetime.strptime(
+                    value.upper().strip(),
+                    fmt,
+                )
+
+                return datetime.combine(
+                    day,
+                    parsed.time(),
+                ).isoformat()
+
             except ValueError:
                 continue
 
@@ -452,4 +695,7 @@ class DeltaFlightStatusClient:
         if end_dt < start_dt:
             end_dt += timedelta(days=1)
 
-        return round((end_dt - start_dt).total_seconds() / 60)
+        return round(
+            (end_dt - start_dt).total_seconds()
+            / 60
+        )

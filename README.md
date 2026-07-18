@@ -1,37 +1,32 @@
-# Delta Flight Dashboard
+# Delta Flight Tracker
 
-A Streamlit dashboard that reads flight information from Delta's public
-flight-status page using a headless Chromium browser.
+This Streamlit application reads Delta's public flight-status details page
+through Selenium and Chromium.
 
-## Important limitation
+## Repository layout
 
-Delta does not publish this web interface as a supported public developer API.
-The page selectors or anti-automation controls may change. The application
-handles several page layouts, but `delta_provider.py` may eventually require an
-update.
-
-## Run locally
-
-Python 3.10+ and Chrome/Chromium are recommended.
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-The app starts in Demo mode. Turn Demo mode off to query Delta.com.
+- `app.py`
+- `delta_provider.py`
+- `flight_utils.py`
+- `requirements.txt`
+- `packages.txt`
+- `.streamlit/config.toml`
 
 ## Streamlit Community Cloud
 
-Push all files to GitHub and deploy `app.py`.
+Deploy `app.py` as the application entrypoint.
 
-`packages.txt` asks Streamlit Cloud to install Chromium and the Chromium driver.
-No flight-data API key is required.
+The provider builds URLs in this form:
 
-## ESP32
+`https://www.delta.com/flightstatus/1/{flight}/{YYYY-MM-DD}/w`
 
-The Streamlit page generates a compact JSON object containing the flight,
-airports, status, gates, terminals, times, delay, baggage claim, and progress.
-A later API service can expose that same payload for an ESP32 to poll.
+Example:
+
+`https://www.delta.com/flightstatus/1/2738/2026-07-18/w`
+
+## Important limitation
+
+Delta's page loads flight details through client-side JavaScript. Delta may block
+or fail to serve that background request to Streamlit Cloud. The application now
+handles that condition as a visible error instead of exposing a raw Selenium
+traceback.

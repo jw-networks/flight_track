@@ -2,22 +2,15 @@ from __future__ import annotations
 
 from datetime import date
 import json
-import time
 
 import streamlit as st
 
 from delta_provider import DeltaFlightStatusClient, DeltaLookupError
-from flight_utils import (
-    build_esp32_payload,
-    demo_flight,
-    format_clock,
-    format_duration,
-    normalize_delta_flight_number,
-    progress_percent,
-)
+from flight_utils import build_esp32_payload, format_datetime
+
 
 st.set_page_config(
-    page_title="Delta Flight Dashboard",
+    page_title="Delta Flight Tracker",
     page_icon="✈️",
     layout="wide",
 )
@@ -25,173 +18,230 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
-      [data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.25);
-        border-radius: 12px;
-        padding: 12px 14px;
-        background: rgba(128,128,128,.055);
-      }
-      .flight-banner {
-        border-radius: 16px;
-        padding: 18px 22px;
-        margin-bottom: 18px;
-        background: linear-gradient(120deg, #710019, #b0002b);
-        color: white;
-      }
-      .flight-banner h2 {margin: 0;}
-      .flight-banner p {margin: 5px 0 0; opacity: .9;}
+        .block-container {
+            max-width: 1200px;
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+        }
+
+        .flight-card {
+            border: 1px solid rgba(128, 128, 128, 0.25);
+            border-radius: 14px;
+            padding: 1.2rem;
+            margin-bottom: 1rem;
+        }
+
+        .airport-code {
+            font-size: 2.5rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .muted {
+            opacity: 0.72;
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_delta_flight(flight_number: str, flight_date: date) -> dict:
-    client = DeltaFlightStatusClient(headless=True)
-    return client.get_flight(flight_number, flight_date)
-
-
-def show_airport(title: str, airport: dict) -> None:
-    st.subheader(title)
-    st.markdown(
-        f"### {airport.get('code') or '—'}  \n"
-        f"{airport.get('name') or ''}"
+@st.cache_data(ttl=120, show_spinner=False)
+def load_delta_flight(
+    flight_number: str,
+    flight_date: date,
+) -> dict:
+    client = DeltaFlightStatusClient(
+        headless=True,
+        timeout=40,
+    )
+    return client.get_flight(
+        flight_number=flight_number,
+        flight_date=flight_date,
     )
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Scheduled", format_clock(airport.get("scheduled")))
-    c2.metric("Estimated", format_clock(airport.get("estimated")))
-    c3.metric("Actual", format_clock(airport.get("actual")))
 
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Terminal", airport.get("terminal") or "—")
-    c5.metric("Gate", airport.get("gate") or "—")
-    c6.metric("Delay", f"{airport.get('delay_minutes', 0)} min")
+def render_airport(
+    title: str,
+    airport: dict,
+) -> None:
+    code = airport.get("code") or "—"
+    name = airport.get("name") or ""
+    city = airport.get("city") or ""
+    terminal = airport.get("terminal") or "—"
+    gate = airport.get("gate") or "—"
+
+    st.markdown(
+        f"""
+        <div class="flight-card">
+            <div class="muted">{title}</div>
+            <div class="airport-code">{code}</div>
+            <div>{name}</div>
+            <div class="muted">{city}</div>
+            <br>
+            <strong>Terminal:</strong> {terminal}<br>
+            <strong>Gate:</strong> {gate}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.write(
+        "**Scheduled:**",
+        format_datetime(airport.get("scheduled")),
+    )
+    st.write(
+        "**Estimated:**",
+        format_datetime(airport.get("estimated")),
+    )
+    st.write(
+        "**Actual:**",
+        format_datetime(airport.get("actual")),
+    )
+
+    delay = airport.get("delay_minutes")
+    if delay is not None:
+        st.write("**Delay:**", f"{delay:+d} minutes")
 
 
-with st.sidebar:
-    st.title("Flight Search")
+def main() -> None:
+    st.title("Delta Flight Tracker")
+    st.caption(
+        "Flight details are read from Delta's public flight-status page."
+    )
 
-    with st.form("flight_search"):
-        raw_number = st.text_input(
-            "Delta flight number",
-            value=st.session_state.get("raw_number", "DL1234"),
-            placeholder="DL1234 or 1234",
-        )
-        selected_date = st.date_input(
-            "Flight date",
-            value=st.session_state.get("selected_date", date.today()),
-        )
-        demo_mode = st.toggle(
-            "Demo mode",
-            value=st.session_state.get("demo_mode", True),
-            help="Uses sample data instead of loading Delta.com.",
-        )
+    with st.form("flight_lookup"):
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            flight_number = st.text_input(
+                "Delta flight number",
+                value="DL2738",
+                placeholder="DL2738",
+            )
+
+        with col2:
+            selected_date = st.date_input(
+                "Flight date",
+                value=date.today(),
+            )
+
         submitted = st.form_submit_button(
             "Load flight",
             type="primary",
             use_container_width=True,
         )
 
-    st.divider()
-    auto_refresh = st.toggle("Auto-refresh", value=False)
-    refresh_seconds = st.select_slider(
-        "Refresh interval",
-        options=[60, 120, 300, 600],
-        value=120,
-        format_func=lambda seconds: f"{seconds} sec",
-        disabled=not auto_refresh,
-    )
+    if not submitted:
+        st.info("Enter a Delta flight number and date.")
+        return
 
-if submitted:
-    st.session_state.raw_number = raw_number
-    st.session_state.selected_date = selected_date
-    st.session_state.demo_mode = demo_mode
-    st.session_state.load_requested = True
-    load_delta_flight.clear()
+    flight_number = flight_number.strip().upper()
 
-st.title("Delta Flight Dashboard")
-st.caption("Flight information loaded directly from Delta.com.")
+    if not flight_number:
+        st.error("Enter a flight number.")
+        return
 
-if not st.session_state.get("load_requested"):
-    st.info("Enter a Delta flight number and select **Load flight**.")
-    st.stop()
-
-try:
-    flight_number = normalize_delta_flight_number(st.session_state.raw_number)
-
-    with st.spinner(f"Checking Delta flight {flight_number}…"):
-        if st.session_state.demo_mode:
-            flight = demo_flight(flight_number, st.session_state.selected_date)
-        else:
+    with st.spinner("Loading Delta flight details..."):
+        try:
             flight = load_delta_flight(
                 flight_number,
-                st.session_state.selected_date,
+                selected_date,
             )
-except (ValueError, DeltaLookupError) as exc:
-    st.error(str(exc))
-    st.caption(
-        "Delta does not publish this web interface as a supported public API. "
-        "A Delta.com layout or bot-protection change may require updating "
-        "`delta_provider.py`."
+        except DeltaLookupError as exc:
+            st.error(str(exc))
+            st.stop()
+        except Exception as exc:
+            st.error(
+                "Delta flight status could not be loaded. "
+                f"Technical details: {type(exc).__name__}: {exc}"
+            )
+            st.stop()
+
+    status = flight.get("status") or "Unknown"
+
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Flight", flight.get("ident", flight_number))
+    top2.metric("Status", status)
+    top3.metric(
+        "Departure delay",
+        _delay_label(
+            flight.get("origin", {}).get("delay_minutes")
+        ),
     )
-    st.stop()
+    top4.metric(
+        "Arrival delay",
+        _delay_label(
+            flight.get("destination", {}).get("delay_minutes")
+        ),
+    )
 
-origin = flight["origin"]
-destination = flight["destination"]
-progress = progress_percent(flight)
+    left, center, right = st.columns([1, 0.25, 1])
 
-st.markdown(
-    f"""
-    <div class="flight-banner">
-      <h2>{flight.get('ident', flight_number)} ·
-      {origin.get('code', '—')} → {destination.get('code', '—')}</h2>
-      <p>{flight.get('status', 'Unknown')} ·
-      Updated {format_clock(flight.get('updated_at'), include_zone=True)}</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    with left:
+        render_airport(
+            "Departure",
+            flight.get("origin", {}),
+        )
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Status", flight.get("status") or "Unknown")
-m2.metric("Progress", f"{progress}%")
-m3.metric("Arrival delay", f"{destination.get('delay_minutes', 0)} min")
-m4.metric("Aircraft", flight.get("aircraft_type") or "—")
-m5.metric("Baggage", destination.get("baggage_claim") or "—")
+    with center:
+        st.markdown(
+            "<div style='text-align:center;font-size:2rem;padding-top:5rem;'>→</div>",
+            unsafe_allow_html=True,
+        )
 
-st.progress(progress / 100, text=f"{progress}% complete")
+    with right:
+        render_airport(
+            "Arrival",
+            flight.get("destination", {}),
+        )
 
-left, right = st.columns(2)
-with left:
-    show_airport("Departure", origin)
-with right:
-    show_airport("Arrival", destination)
+    details1, details2, details3 = st.columns(3)
 
-st.divider()
-st.subheader("Additional Details")
+    with details1:
+        st.subheader("Aircraft")
+        st.write(flight.get("aircraft_type") or "—")
 
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("Scheduled duration", format_duration(flight.get("scheduled_minutes")))
-d2.metric("Estimated duration", format_duration(flight.get("flight_minutes")))
-d3.metric("Departure city", origin.get("city") or "—")
-d4.metric("Arrival city", destination.get("city") or "—")
+    with details2:
+        st.subheader("Baggage")
+        st.write(
+            flight.get("destination", {}).get("baggage_claim")
+            or "—"
+        )
 
-with st.expander("ESP32-ready payload", expanded=True):
+    with details3:
+        st.subheader("Updated")
+        st.write(format_datetime(flight.get("updated_at")))
+
     payload = build_esp32_payload(flight)
-    st.code(json.dumps(payload, indent=2), language="json")
-    st.download_button(
-        "Download JSON",
-        json.dumps(payload, separators=(",", ":")),
-        file_name=f"{flight_number}_display.json",
-        mime="application/json",
+
+    st.subheader("ESP32 payload")
+    st.code(
+        json.dumps(payload, indent=2),
+        language="json",
     )
 
-with st.expander("Normalized Delta data"):
-    st.json(flight)
+    with st.expander("Normalized flight data"):
+        st.json(flight)
 
-if auto_refresh:
-    time.sleep(refresh_seconds)
-    st.rerun()
+    source_url = flight.get("source_url")
+    if source_url:
+        st.link_button(
+            "Open flight on Delta",
+            source_url,
+            use_container_width=True,
+        )
+
+
+def _delay_label(value: int | None) -> str:
+    if value is None:
+        return "—"
+    if value == 0:
+        return "On time"
+    if value > 0:
+        return f"{value} min late"
+    return f"{abs(value)} min early"
+
+
+if __name__ == "__main__":
+    main()
